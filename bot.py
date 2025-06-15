@@ -1,89 +1,119 @@
 import os
-import logging
-import requests
+import random
 from aiogram import Bot, Dispatcher, types
-from fastapi import FastAPI, Request
-from aiogram.types import Update
-from aiogram.dispatcher.webhook import Dispatcher as WebhookDispatcher
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import requests
+from pydantic import BaseModel
+from aiogram.utils import executor
 
-logging.basicConfig(level=logging.INFO)
+# Ваш токен бота
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Получаем переменные окружения
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например, https://yourdomain.com/webhook
-PORT = int(os.getenv("PORT", 8000))
+# Репликационный API и ключ
+REPLICATE_API_KEY = os.getenv("REPLICATE_API_KEY")
+REPLICATE_MODEL = "aitechtree/nsfw-novel-generation"
 
-# Инициализация бота и диспетчера
-bot = Bot(token=TELEGRAM_TOKEN)
+# Создание бота и диспетчера
+bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
-app = FastAPI()
 
-# --- Функция генерации текста через Replicate ---
-def generate_text(prompt: str) -> str:
-    """
-    Отправляет запрос на replicate и возвращает сгенерированный текст
-    """
-    url = "https://api.replicate.com/v1/predictions"
+# Шаблоны для генерации изображений
+TEMPLATES = {
+    "аниме": "A cute anime girl with a magical background.",
+    "реализм": "A realistic painting of a beautiful landscape.",
+}
+
+# Структура для запроса на генерацию
+class ImageRequest(BaseModel):
+    prompt: str
+    style: str
+    is_video: bool = False
+
+
+# Функция для отправки запроса в Replicate
+def generate_image_from_replica(prompt: str, style: str, is_video: bool = False):
     headers = {
-        "Authorization": f"Token {REPLICATE_API_TOKEN}",
+        "Authorization": f"Bearer {REPLICATE_API_KEY}",
         "Content-Type": "application/json",
     }
-    json_data = {
-        "version": "d1b68d1b966f96f97a2364cec456e84fda2d24d50eeb14abe14b509f2223ed97",  # Версия модели
+    
+    payload = {
+        "version": "v1",
         "input": {
             "prompt": prompt,
-            "system_message": "Write(output) in English.",
-            "max_tokens": 7000,
-            "temperature": 0.7,
-            "top_p": 0.9
+            "style": style,
+            "is_video": is_video
         }
     }
-    response = requests.post(url, headers=headers, json=json_data)
-    response.raise_for_status()
-    prediction = response.json()
-    return prediction['output'][0]  # Возвращаем первый результат
 
-# --- Обработчики aiogram ---
+    response = requests.post(f"https://api.replicate.com/v1/predictions", json=payload, headers=headers)
+    result = response.json()
+    
+    return result['urls']['image'] if not is_video else result['urls']['video']
 
-@dp.message(commands=["start"])
-async def start_handler(message: types.Message):
-    await message.answer("Привет! Отправь мне описание для генерации NSFW текста.")
 
-@dp.message()
-async def text_handler(message: types.Message):
-    await message.answer("Генерирую текст, подожди...")
+# Кнопки выбора стиля
+async def generate_style_buttons():
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    button_anime = InlineKeyboardButton("Аниме", callback_data="anime")
+    button_realism = InlineKeyboardButton("Реализм", callback_data="realism")
+    keyboard.add(button_anime, button_realism)
+    return keyboard
 
-    try:
-        generated_text = generate_text(message.text)
-        await message.answer(generated_text)
-    except Exception as e:
-        await message.answer(f"Ошибка при генерации текста: {e}")
 
-# --- FastAPI webhook endpoint ---
+# Кнопка для генерации видео
+async def generate_video_button():
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    button_video = InlineKeyboardButton("Создать видео", callback_data="video")
+    keyboard.add(button_video)
+    return keyboard
 
-@app.post("/webhook")
-async def webhook_handler(request: Request):
-    json_update = await request.json()
-    update = Update(**json_update)
-    await dp.process_update(update)
-    return {"ok": True}
 
-# --- Стартап и шутдаун ---
+# Обработчик команды старт
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
+    welcome_text = "Привет! Я бот для генерации изображений. Выберите стиль:"
+    keyboard = await generate_style_buttons()
+    await message.answer(welcome_text, reply_markup=keyboard)
 
-@app.on_event("startup")
-async def on_startup():
-    await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"Webhook установлен: {WEBHOOK_URL}")
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    await bot.delete_webhook()
-    await bot.session.close()
-    logging.info("Webhook удалён и сессия закрыта")
+# Обработчик выбора стиля
+@dp.callback_query_handler(lambda c: c.data in ['anime', 'realism'])
+async def process_style(callback_query: types.CallbackQuery):
+    style = callback_query.data
+    prompt = TEMPLATES[style]  # Используем шаблон для выбранного стиля
+    is_video = False  # Пока не создаём видео
+    image_url = generate_image_from_replica(prompt, style, is_video)
+    
+    await bot.send_photo(callback_query.from_user.id, image_url)
+    await callback_query.answer()
 
-# --- Запуск uvicorn ---
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("bot:app", host="0.0.0.0", port=PORT)
+# Обработчик кнопки для генерации видео
+@dp.callback_query_handler(lambda c: c.data == 'video')
+async def process_video(callback_query: types.CallbackQuery):
+    prompt = "A futuristic cityscape at night."  # Пример текста для видео
+    style = "реализм"
+    is_video = True
+    video_url = generate_image_from_replica(prompt, style, is_video)
+    
+    await bot.send_video(callback_query.from_user.id, video_url)
+    await callback_query.answer()
+
+
+# Обработчик ввода текста для генерации
+@dp.message_handler(content_types=types.ContentType.TEXT)
+async def generate_from_text(message: types.Message):
+    user_input = message.text
+    prompt = f"Generate an image of {user_input}"  # Конвертация текста в промт
+    style = "аниме"  # Выбираем стиль по умолчанию
+    is_video = False
+    image_url = generate_image_from_replica(prompt, style, is_video)
+    
+    await message.answer(f"Вот изображение по вашему запросу: {user_input}")
+    await bot.send_photo(message.from_user.id, image_url)
+
+
+if __name__ == '__main__':
+    from aiogram import executor
+    executor.start_polling(dp, skip_updates=True)
