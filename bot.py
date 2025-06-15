@@ -1,63 +1,59 @@
 import os
-import replicate
+import asyncio
 from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 from aiogram.types import Message
-from aiogram.filters import CommandStart
-from aiogram.enums import ParseMode
-from aiogram.utils.markdown import hbold
-from fastapi import FastAPI, Request
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.webhook.aiohttp_server import setup_application
-import uvicorn
+import replicate
 
-# 🔧 Конфигурация
-TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
-REPLICATE_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-REPLICATE_MODEL = "aitechtree/nsfw-novel-generation"
+# Токены
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # Токен телеги
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")  # Токен replicate
 
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher(storage=MemoryStorage())
-app = FastAPI()
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
 
-replicate_client = replicate.Client(api_token=REPLICATE_TOKEN)
+client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# 📥 Обработка команд
-@dp.message(CommandStart())
-async def start(msg: Message):
-    await msg.answer("👋 Привет! Отправь описание сцены, и я сгенерирую NSFW изображение.")
+# Пример модели NSFW с replicate (замени на нужную тебе модель)
+MODEL_NAME = "aitechtree/nsfw-novel-generation"  # или другая nsfw-модель
+MODEL_VERSION = None  # если хочешь, укажи версию
+
+@dp.message(Command(commands=["start", "help"]))
+async def cmd_start(message: Message):
+    await message.answer(
+        "Привет! Отправь описание, и я сгенерирую NSFW изображение через replicate.\n"
+        "Пример: красивая девушка в аниме стиле\n"
+        "Без ограничений, без цензуры."
+    )
 
 @dp.message()
-async def generate_image(msg: Message):
-    prompt = msg.text.strip()
-    await msg.answer("🎨 Генерация изображения, подожди...")
+async def generate_image(message: Message):
+    prompt = message.text.strip()
+    if not prompt:
+        await message.answer("Пожалуйста, отправь описание для генерации.")
+        return
+
+    await message.answer("Генерирую изображение, подожди...")
 
     try:
-        output = replicate_client.run(
-            REPLICATE_MODEL,
-            input={"prompt": prompt}
-        )
+        # Генерация через replicate
+        model = client.models.get(MODEL_NAME)
+        version = MODEL_VERSION or model.versions.list()[0]  # берем последнюю, если не указанна
+
+        output = version.predict(prompt=prompt)
+        # output может быть списком URL или одним URL — в зависимости от модели
         if isinstance(output, list):
-            await msg.answer_photo(output[0])
+            image_url = output[0]
         else:
-            await msg.answer("❌ Не удалось получить изображение.")
+            image_url = output
+
+        await message.answer_photo(photo=image_url, caption=f"Результат для:\n{prompt}")
+
     except Exception as e:
-        await msg.answer(f"⚠️ Ошибка: {str(e)}")
+        await message.answer(f"Произошла ошибка при генерации: {e}")
 
-# 🌐 Вебхук роут
-@app.post("/webhook")
-async def webhook(request: Request):
-    body = await request.json()
-    await dp.feed_webhook_update(bot, body)
-    return {"ok": True}
-
-# 🧩 Настройка FastAPI + aiogram
-def main():
-    import asyncio
-    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-
-    dp.startup.register(lambda _: bot.set_webhook("https://prada.onrender.com"))
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+async def main():
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
