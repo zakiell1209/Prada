@@ -1,129 +1,148 @@
 import os
 import asyncio
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, Text
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-import replicate
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import httpx
 
-# Токен телеги и replicate токен — вставь свои
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+# ========== Настройки ==========
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # Токен твоего телеграм-бота
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")  # Токен replicate
 
-# Инициализация бота и диспетчера
+if not TELEGRAM_TOKEN or not REPLICATE_API_TOKEN:
+    print("Ошибка! Задай TELEGRAM_TOKEN и REPLICATE_API_TOKEN в переменных окружения.")
+    exit(1)
+
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Инициализация клиента replicate
-client = replicate.Client(api_token=REPLICATE_API_TOKEN)
-
-# Стили для генерации
-STYLES = {
-    "anime": "anime style, colorful, detailed",
-    "realistic": "realistic photo, high resolution, 4k",
-    "nsfw": "nsfw, explicit, detailed",
-    "cyberpunk": "cyberpunk style, neon lights",
-}
-
-# Кнопки выбора стиля и видео
-style_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="Аниме", callback_data="style:anime"),
-     InlineKeyboardButton(text="Реализм", callback_data="style:realistic")],
-    [InlineKeyboardButton(text="NSFW", callback_data="style:nsfw"),
-     InlineKeyboardButton(text="Киберпанк", callback_data="style:cyberpunk")],
-    [InlineKeyboardButton(text="Создать Видео", callback_data="video:start")],
+# ================== Кнопки выбора стиля и типа ===================
+STYLE_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="Аниме", callback_data="style:anime"),
+        InlineKeyboardButton(text="Реализм", callback_data="style:realism"),
+    ],
+    [
+        InlineKeyboardButton(text="Сгенерировать Видео", callback_data="type:video"),
+        InlineKeyboardButton(text="Сгенерировать Картинку", callback_data="type:image"),
+    ],
 ])
 
-# Состояния пользователя (стиль, режим)
-users_settings = {}
+# Хранение состояния для каждого пользователя (можно заменить на БД для продакшена)
+user_settings = {}
 
-# Функция конвертации пользовательского ввода в промт
-def create_prompt(text: str, style: str) -> str:
-    base_prompt = f"{text.strip()}, {STYLES.get(style, '')}"
-    return base_prompt
+# ============ Функции конвертации текста в промты для каждого стиля =============
+def convert_to_prompt(text: str, style: str) -> str:
+    base_prompt = text.strip()
+    if style == "anime":
+        # простой шаблон для аниме стиля
+        return f"anime style, detailed, {base_prompt}"
+    elif style == "realism":
+        return f"realistic, photo quality, {base_prompt}"
+    else:
+        return base_prompt
 
-# Хендлер старт
+# =============== Вызов replicate API для генерации изображения или видео ===============
+async def replicate_generate(prompt: str, is_video: bool = False) -> str:
+    # Используем модель aitechtree/nsfw-novel-generation для примера
+    model_version = "aitechtree/nsfw-novel-generation:1d2c8f0f8f05ca5fbc4710e5d2701d7ee5553c70c917fd11db9d93bf6f3124f5"
+    api_url = f"https://api.replicate.com/v1/predictions"
+
+    input_data = {
+        "prompt": prompt,
+        "mode": "video" if is_video else "image",
+    }
+
+    headers = {
+        "Authorization": f"Token {REPLICATE_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        response = await client.post(
+            api_url,
+            headers=headers,
+            json={
+                "version": model_version,
+                "input": input_data,
+            },
+        )
+        response.raise_for_status()
+        prediction = response.json()
+
+    # Ждём, пока предсказание завершится
+    prediction_url = f"https://api.replicate.com/v1/predictions/{prediction['id']}"
+    while True:
+        async with httpx.AsyncClient(timeout=300) as client:
+            status_resp = await client.get(prediction_url, headers=headers)
+            status_resp.raise_for_status()
+            status_data = status_resp.json()
+
+        status = status_data["status"]
+        if status == "succeeded":
+            output = status_data["output"]
+            if isinstance(output, list):
+                # если несколько ссылок - берём первую
+                return output[0]
+            return output
+        elif status == "failed":
+            raise Exception("Ошибка генерации в replicate: " + str(status_data))
+        await asyncio.sleep(2)
+
+# ======================= Обработчики Telegram =======================
 @dp.message(Command("start"))
-async def start_handler(message: types.Message):
-    users_settings[message.from_user.id] = {"style": "realistic", "video": False}
+async def cmd_start(message: types.Message):
+    user_settings[message.from_user.id] = {"style": "anime", "type": "image"}
     await message.answer(
-        "Привет! Я бот для генерации изображений и видео с поддержкой NSFW.\n"
-        "Выбери стиль и отправь описание для генерации.\n",
-        reply_markup=style_kb
+        "Привет! Я бот для генерации NSFW изображений и видео.\n"
+        "Выбери стиль и тип генерации с помощью кнопок ниже.\n"
+        "Отправь мне описание для генерации.",
+        reply_markup=STYLE_KEYBOARD,
     )
 
-# Хендлер кнопок
-@dp.callback_query(Text(startswith="style:"))
-async def style_chosen(call: types.CallbackQuery):
-    style = call.data.split(":")[1]
-    users_settings[call.from_user.id] = users_settings.get(call.from_user.id, {"style":"realistic", "video": False})
-    users_settings[call.from_user.id]["style"] = style
-    users_settings[call.from_user.id]["video"] = False
-    await call.answer(f"Стиль выбран: {style}")
-    await call.message.answer("Отправь описание (на русском) для генерации изображения:")
+@dp.callback_query()
+async def callback_handler(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    data = callback.data
 
-@dp.callback_query(Text(startswith="video:"))
-async def video_chosen(call: types.CallbackQuery):
-    users_settings[call.from_user.id] = users_settings.get(call.from_user.id, {"style":"realistic", "video": False})
-    users_settings[call.from_user.id]["video"] = True
-    await call.answer("Режим видео выбран")
-    await call.message.answer("Отправь описание (на русском) для генерации видео:")
+    if data.startswith("style:"):
+        style = data.split(":")[1]
+        user_settings.setdefault(user_id, {})["style"] = style
+        await callback.answer(f"Выбран стиль: {style}")
+    elif data.startswith("type:"):
+        gen_type = data.split(":")[1]
+        user_settings.setdefault(user_id, {})["type"] = gen_type
+        await callback.answer(f"Выбран тип генерации: {gen_type}")
 
-# Хендлер текста — генерация
-@dp.message(F.text)
+@dp.message()
 async def generate_handler(message: types.Message):
     user_id = message.from_user.id
-    settings = users_settings.get(user_id, {"style": "realistic", "video": False})
-    prompt = create_prompt(message.text, settings["style"])
+    settings = user_settings.get(user_id, {"style": "anime", "type": "image"})
 
-    await message.answer(f"Генерирую {'видео' if settings['video'] else 'изображение'}...\nПромт:\n{prompt}")
+    style = settings["style"]
+    gen_type = settings["type"]
+
+    prompt = convert_to_prompt(message.text, style)
+
+    await message.answer("Генерирую, пожалуйста подожди...")
 
     try:
-        if settings["video"]:
-            # Запуск генерации видео через replicate (пример модели)
-            # Замените на актуальную модель генерации видео с replicate
-            model = client.models.get("aitechtree/nsfw-novel-generation")  # можно поменять
-            version = model.versions.list()[0]  # берем последнюю версию
-            prediction = client.predictions.create(
-                version=version.id,
-                input={"prompt": prompt, "mode": "video"}
-            )
-            # Ждем пока закончится (упрощенно)
-            while prediction.status not in ["succeeded", "failed", "canceled"]:
-                await asyncio.sleep(3)
-                prediction = client.predictions.get(id=prediction.id)
-            if prediction.status == "succeeded":
-                await message.answer(f"Видео готово:\n{prediction.output}")
-            else:
-                await message.answer(f"Ошибка генерации видео: {prediction.status}")
+        is_video = gen_type == "video"
+        output_url = await replicate_generate(prompt, is_video)
+        if is_video:
+            await message.answer_video(output_url)
         else:
-            # Генерация изображения
-            model = client.models.get("aitechtree/nsfw-novel-generation")
-            version = model.versions.list()[0]
-            prediction = client.predictions.create(
-                version=version.id,
-                input={"prompt": prompt}
-            )
-            # Ждем окончания
-            while prediction.status not in ["succeeded", "failed", "canceled"]:
-                await asyncio.sleep(2)
-                prediction = client.predictions.get(id=prediction.id)
-            if prediction.status == "succeeded":
-                # prediction.output — ссылка на изображение или список ссылок
-                output = prediction.output
-                if isinstance(output, list):
-                    output = output[0]
-                await message.answer_photo(photo=output)
-            else:
-                await message.answer(f"Ошибка генерации изображения: {prediction.status}")
-
+            await message.answer_photo(output_url)
     except Exception as e:
-        await message.answer(f"Произошла ошибка: {e}")
+        await message.answer(f"Ошибка генерации: {e}")
 
-    await message.answer("Выбери стиль или видео для новой генерации:", reply_markup=style_kb)
-
-# Запуск бота
+# ======================== Запуск бота ========================
 if __name__ == "__main__":
     import logging
+
     logging.basicConfig(level=logging.INFO)
-    from aiogram import executor
-    executor.start_polling(dp, skip_updates=True)
+    print("Бот запущен...")
+
+    import asyncio
+
+    asyncio.run(dp.start_polling(bot))
