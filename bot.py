@@ -55,7 +55,7 @@ def main():
     import asyncio
     from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-    dp.startup.register(lambda _: bot.set_webhook("https://YOUR-RENDER-URL.onrender.com/webhook"))
+    dp.startup.register(lambda _: bot.set_webhook("https://prada.onrender.com"))
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
